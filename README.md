@@ -1,6 +1,4 @@
-# ATLAS - Self-Improving AI Trading Agents
-
-**Built by [General Intelligence Capital](https://generalintelligencecapital.com)**
+# ARGOS - Self-Improving AI Trading Agents
 
 [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) applied to financial markets. The agent prompts are the weights. Sharpe ratio is the loss function. No GPU needed.
 
@@ -8,11 +6,9 @@
 
 ## What Is This?
 
-ATLAS is a framework for autonomous AI trading agents that improve their own prompts through market feedback.
+ARGOS is a framework for autonomous AI trading agents that improve their own prompts through market feedback.
 
 25 agents debate markets daily across 4 layers. Every recommendation is scored against real outcomes. The worst-performing agent gets its prompt rewritten. If performance improves, the git commit survives. If not, git revert.
-
-The trained prompts are the product of 378 days of evolutionary optimisation against 18 months of real market data. They are proprietary. This repo contains the framework and the results.
 
 ---
 
@@ -24,7 +20,7 @@ Central bank, geopolitical, China, dollar, yield curve, commodities, volatility,
 These agents set the regime. Risk on or risk off? What's the macro backdrop?
 
 ### Layer 2 - Sector Desks (7 agents)
-Semiconductor, energy, biotech, consumer, industrials, financials, plus a Bloomberg-style relationship mapper that tracks supply chains, ownership, analyst coverage, and competitive dynamics for every name.
+Semiconductor, energy, biotech, consumer, industrials, financials, plus a relationship mapper that tracks supply chains, ownership, analyst coverage, and competitive dynamics.
 
 They take the macro regime from Layer 1 and identify the best names within each sector.
 
@@ -63,7 +59,7 @@ Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch).
 - Checks if agent's Sharpe improved
 - Keep (git commit) or revert (git reset)
 
-The agent prompts are the weights being optimised. Each trading day is one training iteration. A $20/month VM replaces the H100.
+The agent prompts are the weights being optimised. Each trading day is one training iteration.
 
 **Darwinian Weights:**
 Each agent has a weight between 0.3 (minimum, near-silenced) and 2.5 (maximum, highly trusted). After each day, top quartile agents get weight x 1.05. Bottom quartile get weight x 0.95. The CIO proportionally weights agent input by these scores.
@@ -72,86 +68,135 @@ Over time, good agents get louder. Bad agents get quieter. The system learns who
 
 ---
 
-## 18-Month Backtest Results
+## Data Pipeline
 
-**Period:** September 2024 - March 2026 (378 trading days)
+### Market Data
+- **FRED** - 30 macro series (rates, credit, labor, inflation, sentiment)
+- **yfinance** - indices, sector ETFs, commodities, bonds, currencies, volatility
+- **FMP** - fundamentals, financials (with stable API fallback)
 
-### Autoresearch Stats
-- Prompt modifications attempted: 54
-- Survived (kept): 16 (30%)
-- Reverted: 37 (70%)
-- Agents modified: volatility, semiconductor, china, news sentiment, emerging markets, financials, and others
+### EOD Data Store
+Pre-cached local data store for all S&P 500 + macro tickers:
+- **Daily OHLCV** - full history per ticker
+- **1-Hour Intraday** - granular price action
+- **Fundamentals** - financials, analyst ratings, institutional holdings, options data
 
-### Performance
-- Deployment phase return: **+22% in 173 days**
-- Best individual pick: **AVGO at $152, held for +128%**
+Incremental updates — only fetches new days since last stored date.
 
-### Darwinian Agent Weights
-
-The system learned which agents to trust. Macro-regime and quality-compounder agents rose to maximum weight. The system's own portfolio manager (CIO) was downweighted to the minimum — it discovered the orchestration bottleneck before we did.
-
-Full agent weight details are proprietary.
-
-### Equity Curve
-
-![Equity Curve](results/equity_curve.png)
-
-### Darwinian Weight Evolution
-
-![Agent Weights](results/agent_weights.png)
+### Stock Universe
+- Full **S&P 500** constituents (fetched from Wikipedia, mapped via GICS sectors)
+- **Sector ETFs** (SMH, XLE, XBI, XLY, XLI, XLF) with per-desk metrics
+- **37 macro market tickers** (indices, commodities, bonds, currencies)
 
 ---
 
-## Key Insight
+## Project Structure
 
-The orchestration layer matters as much as the intelligence layer.
-
-Individual agents improved measurably through autoresearch - the financials agent's Sharpe improved from -4.14 to 0.45, emerging markets improved from -0.45 to -0.06, semiconductor improved from -0.26 to -0.06. But portfolio returns depend heavily on how agent signals are converted to sized positions.
-
-**The lesson:** in any multi-agent system, the synthesis/decision layer is the bottleneck. Improving individual agent intelligence without improving orchestration yields diminishing returns.
+```
+argos/
+├── src/
+│   ├── config.py                  # Settings, agent registry, constants
+│   ├── agents/
+│   │   ├── eod_cycle.py           # 4-layer daily pipeline orchestration
+│   │   ├── backtest_loop.py       # Portfolio simulation + training loop
+│   │   ├── market_data.py         # Multi-source data provider (FMP, FRED, yfinance)
+│   │   ├── eod_store.py           # Incremental EOD data store
+│   │   ├── scorecard.py           # Agent Sharpe ratios + Darwinian weights
+│   │   ├── autoresearch.py        # Self-improving prompt evolution
+│   │   └── universe.py            # S&P 500 universe + GICS sector mapping
+│   └── utils/
+│       ├── llm.py                 # Anthropic API wrapper with retries
+│       ├── git_ops.py             # Git branching for autoresearch
+│       └── logging.py             # Structured logging (JSONL)
+├── prompts/trained/               # 25 agent prompts (evolutionary optimised)
+├── data/
+│   ├── eod/                       # Cached daily + hourly price data
+│   ├── fundamentals/              # Cached company fundamentals
+│   ├── state/                     # Live pipeline state (weights, portfolio, regime)
+│   ├── logs/                      # Structured logs (trades, performance, agent calls)
+│   └── cache/                     # S&P 500 constituent cache
+├── results/                       # Backtest outputs (summary, charts, trajectory)
+├── pyproject.toml
+└── .env                           # API keys (not committed)
+```
 
 ---
 
-## What's Included
+## Quick Start
 
-- Framework architecture and pipeline structure
-- Autoresearch loop design
-- Backtest results, equity curve, agent weight evolution
-- Example placeholder prompts (generic, not trained)
-- Full methodology documentation
+### 1. Install
 
-## What's NOT Included
+```bash
+pip install -e ".[dev,data]"
+```
 
-- Trained agent prompts (proprietary - 378 days of evolutionary optimisation)
-- CIO active management rules
-- Agent scorecard data
-- Live portfolio positions
-- Infrastructure and deployment details
+### 2. Set up API keys
 
-The trained prompts are the core intellectual property. They are the product of market-driven evolutionary selection.
+```bash
+cp .env.example .env
+# Add your keys: ANTHROPIC_API_KEY, FRED_API_KEY, FMP_API_KEY (optional)
+```
+
+### 3. Download market data
+
+```bash
+# Initial download (daily + hourly + fundamentals for ~544 tickers)
+python -m src.agents.eod_store
+
+# Incremental update (only fetches new days)
+python -m src.agents.eod_store
+
+# Check coverage
+python -m src.agents.eod_store --coverage
+```
+
+### 4. Run a backtest
+
+```bash
+# Full backtest (uses Anthropic API — each day calls 25 agents)
+argos-backtest --start 2026-01-01 --end 2026-03-12
+
+# Or run directly
+python -m src.agents.backtest_loop --start 2026-01-01 --end 2026-03-12
+```
+
+### 5. Run live EOD cycle
+
+```bash
+argos-eod
+```
 
 ---
 
-## Now Running Live
+## Outputs
 
-The trained agents are deployed on real market data.
+### Results (`results/`)
+- `summary.json` - return, Sharpe, max drawdown, agent weights
+- `equity_curve.png` - NAV, daily returns, drawdown chart
+- `agent_weights.png` - Darwinian weights + Sharpe ratios
+- `exposure.png` - gross/net exposure over time
+- `portfolio_trajectory.csv` - daily NAV series
+
+### Logs (`data/logs/`)
+- `argos_YYYY-MM-DD.log` - human-readable daily log
+- `trades.jsonl` - every trade execution
+- `performance.jsonl` - daily NAV/exposure snapshots
+- `agent_calls.jsonl` - all agent inputs/outputs
+- `weights.jsonl` - Darwinian weight changes
+- `autoresearch.jsonl` - prompt modification events
+- `errors.jsonl` - failures with context
 
 ---
 
 ## Tech Stack
 
 - **Agents:** Claude Sonnet (Anthropic API)
-- **Data:** FMP, Finnhub, Polygon, FRED
-- **Infrastructure:** Azure VM ($20/month)
+- **Data:** FRED, yfinance, FMP (optional)
 - **Version Control:** Git feature branches for autoresearch tracking
-- **Cost:** ~$50-80 for full 18-month backtest
+- **Language:** Python 3.11+
 
 ---
 
-## Contact
+## License
 
-**Chris Worsey** - CEO & Technical Founder, General Intelligence Capital
-
-chris@generalintelligencecapital.com
-
-[generalintelligencecapital.com](https://generalintelligencecapital.com)
+MIT License - see [LICENSE](LICENSE) for details.

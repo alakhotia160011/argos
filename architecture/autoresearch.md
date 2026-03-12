@@ -2,9 +2,9 @@
 
 ## Concept
 
-Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), ATLAS uses a similar pattern for financial markets:
+Inspired by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch), ARGOS uses a similar pattern for financial markets:
 
-| Karpathy's Version | ATLAS Version |
+| Karpathy's Version | ARGOS Version |
 |-------------------|---------------|
 | Agent modifies `train.py` | Agent modifies prompt file |
 | 5-minute GPU training | 5 trading days observation |

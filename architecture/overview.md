@@ -1,8 +1,8 @@
-# ATLAS Architecture Overview
+# ARGOS Architecture Overview
 
 ## System Design
 
-ATLAS is a 4-layer multi-agent system where each layer progressively filters and refines trading signals.
+ARGOS is a 4-layer multi-agent system where each layer progressively filters and refines trading signals.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐

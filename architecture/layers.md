@@ -1,4 +1,4 @@
-# ATLAS Layer Architecture
+# ARGOS Layer Architecture
 
 ## Layer 1: Macro (10 Agents)
 

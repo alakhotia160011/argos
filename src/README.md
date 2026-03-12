@@ -1,6 +1,6 @@
 # Source Code
 
-The ATLAS framework is implemented in Python. The core modules are:
+The ARGOS framework is implemented in Python. The core modules are:
 
 ## Architecture
 
