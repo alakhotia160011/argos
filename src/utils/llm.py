@@ -91,6 +91,39 @@ async def call_agent_json(
     return extract_json(text)
 
 
+def _find_json_object(text: str, start: int = 0) -> str | None:
+    """Find a complete JSON object using bracket counting.
+
+    Handles arbitrary nesting depth unlike regex approaches.
+    """
+    idx = text.find("{", start)
+    if idx == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(idx, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[idx : i + 1]
+    return None
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Extract the first JSON object from a text response."""
     # Try parsing the whole response first
@@ -99,19 +132,21 @@ def extract_json(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
 
-    # Look for JSON in code blocks
-    match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text)
+    # Look for JSON in code blocks — extract the block then bracket-count
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
     if match:
-        try:
-            return json.loads(match.group(1))
-        except json.JSONDecodeError:
-            pass
+        candidate = _find_json_object(match.group(1))
+        if candidate:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                pass
 
-    # Look for any JSON object
-    match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", text, re.DOTALL)
-    if match:
+    # Bracket-counting fallback on the whole text
+    candidate = _find_json_object(text)
+    if candidate:
         try:
-            return json.loads(match.group(0))
+            return json.loads(candidate)
         except json.JSONDecodeError:
             pass
 

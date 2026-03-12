@@ -155,7 +155,7 @@ class Scorecard:
             return 0.0
 
         returns = [r.weighted_return for r in recs]
-        std = np.std(returns)
+        std = np.std(returns, ddof=1)
         if std == 0:
             return 0.0
         return float(np.mean(returns) / std)
@@ -166,12 +166,11 @@ class Scorecard:
             self.scores[name].sharpe = self.agent_sharpe(name)
             agent_recs = [r for r in self.recommendations if r.agent == name]
             self.scores[name].total_recs = len(agent_recs)
-            if agent_recs:
-                wins = sum(
-                    1 for r in agent_recs
-                    if r.weighted_return is not None and r.weighted_return > 0
-                )
-                self.scores[name].win_rate = wins / len(agent_recs)
+            # Only count scored recs (those with filled forward returns)
+            scored = [r for r in agent_recs if r.weighted_return is not None]
+            if scored:
+                wins = sum(1 for r in scored if r.weighted_return > 0)
+                self.scores[name].win_rate = wins / len(scored)
 
     # ── Darwinian weights ────────────────────────────────────────────────
 

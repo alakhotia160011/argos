@@ -6,6 +6,7 @@ yfinance is used as a free fallback when FMP returns 403/401.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import date, datetime, timedelta
@@ -136,6 +137,37 @@ class MarketDataProvider:
         logger.info("FMP quotes failed, falling back to yfinance for %d tickers", len(tickers))
         return _yf_get_quotes(tickers)
 
+    async def get_quotes_as_of(self, tickers: list[str], as_of: date) -> dict[str, dict]:
+        """Get closing prices as of a specific date from the local store.
+
+        Used during backtesting to avoid look-ahead bias. Falls back to
+        get_historical_price if store data is missing.
+        """
+        from src.agents.eod_store import get_historical_from_store, store_has_data
+
+        result: dict[str, dict] = {}
+        to_str = as_of.isoformat()
+        from_str = (as_of - timedelta(days=5)).isoformat()  # small window to find last trading day
+
+        for ticker in tickers:
+            try:
+                if store_has_data(ticker):
+                    df = get_historical_from_store(ticker, from_str, to_str)
+                else:
+                    df = await self.get_historical_price(ticker, from_str, to_str)
+
+                if not df.empty:
+                    last = df.iloc[-1]
+                    result[ticker] = {
+                        "symbol": ticker,
+                        "price": float(last["close"]),
+                        "volume": float(last.get("volume", 0)),
+                    }
+            except Exception:
+                continue
+
+        return result
+
     async def get_historical_price(
         self, ticker: str, from_date: str, to_date: str
     ) -> pd.DataFrame:
@@ -223,7 +255,20 @@ class MarketDataProvider:
 
     # ── FRED ─────────────────────────────────────────────────────────────
 
-    async def _fred(self, series_id: str, limit: int = 60) -> pd.DataFrame:
+    async def _fred(self, series_id: str, limit: int = 60, as_of: date | None = None) -> pd.DataFrame:
+        """Fetch FRED series. Checks local macro store first, then API.
+
+        as_of: date cutoff — only return observations on or before this date.
+        """
+        from src.agents.eod_store import macro_store_has_data, load_macro_series
+        if macro_store_has_data(series_id):
+            df = load_macro_series(series_id)
+            if not df.empty:
+                if as_of is not None:
+                    df = df[df["date"] <= pd.Timestamp(as_of)]
+                return df.tail(limit).reset_index(drop=True)
+
+        # Fall back to API
         url = "https://api.stlouisfed.org/fred/series/observations"
         params = {
             "series_id": series_id,
@@ -232,6 +277,8 @@ class MarketDataProvider:
             "sort_order": "desc",
             "limit": limit,
         }
+        if as_of is not None:
+            params["observation_end"] = as_of.isoformat()
         resp = await self._http.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -263,29 +310,44 @@ class MarketDataProvider:
 
     # ── yfinance market data (commodities, indices, ETFs) ────────────────
 
-    async def _yf_latest_price(self, ticker: str) -> float | None:
-        """Get latest price for a ticker via yfinance."""
+    async def _yf_latest_price(self, ticker: str, as_of: date | None = None) -> float | None:
+        """Get latest price for a ticker via yfinance.
+
+        as_of: date cutoff for backtest mode (defaults to today for live).
+        """
+        ref = as_of or date.today()
         try:
-            df = _yf_get_historical(ticker, (date.today() - timedelta(days=7)).isoformat(), date.today().isoformat())
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(
+                None, _yf_get_historical, ticker,
+                (ref - timedelta(days=7)).isoformat(), ref.isoformat(),
+            )
             if df.empty:
                 return None
             return float(df.iloc[-1]["close"])
         except Exception:
             return None
 
-    async def _yf_returns(self, ticker: str, days: int = 20) -> dict[str, float | None]:
-        """Get price and returns for a ticker."""
+    async def _yf_returns(self, ticker: str, days: int = 20, as_of: date | None = None) -> dict[str, float | None]:
+        """Get price and returns for a ticker.
+
+        as_of: date cutoff for backtest mode (defaults to today for live).
+        """
+        ref = as_of or date.today()
         try:
-            start = (date.today() - timedelta(days=days + 10)).isoformat()
-            df = _yf_get_historical(ticker, start, date.today().isoformat())
+            start = (ref - timedelta(days=days + 10)).isoformat()
+            loop = asyncio.get_event_loop()
+            df = await loop.run_in_executor(
+                None, _yf_get_historical, ticker, start, ref.isoformat(),
+            )
             if df.empty or len(df) < 2:
                 return {"price": None, "return_1d": None, "return_5d": None, "return_20d": None}
             returns = df["close"].pct_change().dropna()
             return {
                 "price": float(df.iloc[-1]["close"]),
                 "return_1d": float(returns.iloc[-1]) if len(returns) >= 1 else None,
-                "return_5d": float(returns.tail(5).sum()) if len(returns) >= 5 else None,
-                "return_20d": float(returns.tail(20).sum()) if len(returns) >= 20 else None,
+                "return_5d": float((1 + returns.tail(5)).prod() - 1) if len(returns) >= 5 else None,
+                "return_20d": float((1 + returns.tail(20)).prod() - 1) if len(returns) >= 20 else None,
             }
         except Exception:
             return {"price": None, "return_1d": None, "return_5d": None, "return_20d": None}
@@ -394,7 +456,7 @@ class MarketDataProvider:
 
         # ── FRED data (all series in parallel) ──
         fred_tasks = {
-            name: self._fred(series_id)
+            name: self._fred(series_id, as_of=as_of)
             for name, series_id in self.FRED_SERIES.items()
         }
         fred_results = await asyncio.gather(*fred_tasks.values(), return_exceptions=True)
@@ -422,7 +484,7 @@ class MarketDataProvider:
 
         # ── Market data via yfinance (indices, commodities, etc.) ──
         market_tasks = {
-            name: self._yf_returns(ticker)
+            name: self._yf_returns(ticker, as_of=as_of)
             for name, ticker in self.MARKET_TICKERS.items()
         }
         market_results = await asyncio.gather(*market_tasks.values(), return_exceptions=True)
@@ -504,16 +566,20 @@ class MarketDataProvider:
         tickers: list[str],
         lookback_days: int = 60,
         etf_ticker: str | None = None,
+        as_of: date | None = None,
     ) -> dict[str, Any]:
         """Fetch price data and fundamentals for sector tickers.
 
         If etf_ticker is provided, includes ETF-level metrics under the
         "_etf" key so sector agents can see broad sector momentum.
+
+        as_of: date cutoff for backtest mode (defaults to today for live).
         """
         import asyncio
 
-        to_date = date.today().isoformat()
-        from_date = (date.today() - timedelta(days=lookback_days + 10)).isoformat()
+        ref_date = as_of or date.today()
+        to_date = ref_date.isoformat()
+        from_date = (ref_date - timedelta(days=lookback_days + 10)).isoformat()
 
         # Include ETF in the fetch if provided
         all_tickers = list(tickers) + ([etf_ticker] if etf_ticker else [])
@@ -532,8 +598,8 @@ class MarketDataProvider:
                 "price": float(last["close"]),
                 "volume": float(last["volume"]),
                 "return_1d": float(returns.iloc[-1]) if len(returns) > 0 else 0,
-                "return_5d": float(returns.tail(5).sum()) if len(returns) >= 5 else 0,
-                "return_20d": float(returns.tail(20).sum()) if len(returns) >= 20 else 0,
+                "return_5d": float((1 + returns.tail(5)).prod() - 1) if len(returns) >= 5 else 0,
+                "return_20d": float((1 + returns.tail(20)).prod() - 1) if len(returns) >= 20 else 0,
                 "volatility_20d": float(returns.tail(20).std() * np.sqrt(252)) if len(returns) >= 20 else 0,
                 "rsi_14": _compute_rsi(price_data["close"], 14),
                 "sma_50_vs_price": _sma_ratio(price_data["close"], 50),
@@ -541,7 +607,7 @@ class MarketDataProvider:
 
             if ticker == etf_ticker:
                 # Add extra ETF-specific fields
-                metrics["return_60d"] = float(returns.tail(60).sum()) if len(returns) >= 60 else 0
+                metrics["return_60d"] = float((1 + returns.tail(60)).prod() - 1) if len(returns) >= 60 else 0
                 metrics["sma_20_vs_price"] = _sma_ratio(price_data["close"], 20)
                 sector_data["_etf"] = {"ticker": etf_ticker, **metrics}
             else:

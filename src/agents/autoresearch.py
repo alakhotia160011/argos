@@ -119,12 +119,15 @@ async def generate_modification(
         if "## Modification Description" in desc_part:
             description = desc_part.split("## Modification Description")[1].strip()
 
-        # Extract prompt (strip code fences if present)
+        # Extract prompt (strip outer code fences only, preserve internal ones)
         new_prompt = prompt_part.strip()
         if new_prompt.startswith("```"):
             lines = new_prompt.split("\n")
-            # Remove first and last ``` lines
-            lines = [l for l in lines if not l.strip().startswith("```")]
+            # Only strip first and last lines if they are code fences
+            if lines and lines[0].strip().startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
             new_prompt = "\n".join(lines)
     else:
         # Fallback: use entire response as prompt
@@ -223,8 +226,12 @@ class AutoresearchEngine:
             logger.warning("Autoresearch: empty modification generated, skipping")
             return None
 
-        # Create git branch and apply
+        # Create git branch and apply (backup original prompt first)
         branch_name = f"autoresearch/{agent_name}-day{current_day}"
+        original_prompt = current_prompt
+        backup_path = prompt_path.with_suffix(".md.bak")
+        backup_path.write_text(original_prompt)
+
         try:
             repo = git_ops.get_repo()
             git_ops.create_branch(repo, branch_name)
@@ -233,10 +240,15 @@ class AutoresearchEngine:
                 repo, prompt_path,
                 f"autoresearch: {description[:80]}",
             )
+            # Git succeeded, remove backup
+            backup_path.unlink(missing_ok=True)
         except Exception as e:
             logger.error("Git operation failed: %s", e)
-            # Write the prompt anyway even without git
-            prompt_path.write_text(new_prompt)
+            # Restore original prompt from backup
+            prompt_path.write_text(original_prompt)
+            backup_path.unlink(missing_ok=True)
+            logger.info("Restored original prompt for %s after git failure", agent_name)
+            return None
 
         mod = Modification(
             day=current_day,

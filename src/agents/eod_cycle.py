@@ -82,6 +82,7 @@ async def run_macro_layer(
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     signals = []
+    successful_weight_sum = 0.0
     agent_outputs = {}
     for result in results:
         if isinstance(result, Exception):
@@ -103,12 +104,13 @@ async def run_macro_layer(
             numeric = 0.0
 
         signals.append(numeric)
+        successful_weight_sum += weight
 
     if not signals:
         regime = "NEUTRAL"
         regime_score = 0.0
     else:
-        regime_score = sum(signals) / sum(weights.get(a.name, 1.0) for a in agents)
+        regime_score = sum(signals) / successful_weight_sum
         if regime_score > REGIME_RISK_ON_THRESHOLD:
             regime = "RISK_ON"
         elif regime_score < REGIME_RISK_OFF_THRESHOLD:

@@ -8,6 +8,20 @@ Simulates N trading days:
 5. Update Darwinian weights
 6. Trigger autoresearch if conditions met
 7. Log everything
+
+Bias controls:
+  - All data functions receive `as_of=trading_date` to prevent look-ahead.
+  - Prices come from the local EOD store via `get_quotes_as_of()`.
+  - FRED macro data is filtered to `<= trading_date`.
+  - Sector data uses `trading_date` as the end of the lookback window.
+
+Known residual biases (not fixable without point-in-time datasets):
+  - Survivorship: S&P 500 universe is today's membership list, not point-in-time.
+  - Fundamentals look-ahead: yfinance returns the latest financials, not
+    the version available on `trading_date`.
+  - News look-ahead: Finnhub news is live, not date-filtered.
+  These biases are minor for short backtests (< 1 year) but significant for
+  multi-year tests. Use results directionally, not as precise P&L forecasts.
 """
 
 from __future__ import annotations
@@ -70,23 +84,21 @@ class Portfolio:
     cash: float = DEFAULT_INITIAL_CASH
     positions: dict[str, Position] = field(default_factory=dict)
     history: list[dict] = field(default_factory=list)
-
-    @property
-    def total_value(self) -> float:
-        return self.cash + sum(
-            p.shares * p.entry_price * (-1 if p.is_short else 1)
-            for p in self.positions.values()
-        )
+    trade_count: int = 0
 
     def mark_to_market(self, prices: dict[str, float]) -> float:
-        """Calculate portfolio value using current prices."""
+        """Calculate portfolio value using current prices.
+
+        Cash already includes short sale proceeds, so short positions
+        contribute only their unrealised P&L (entry - current) * shares.
+        Long positions contribute current_price * shares.
+        """
         value = self.cash
         for ticker, pos in self.positions.items():
             price = prices.get(ticker, pos.entry_price)
             if pos.is_short:
-                # Short P&L: entry_price - current_price
-                pnl = (pos.entry_price - price) * pos.shares
-                value += pos.entry_price * pos.shares + pnl
+                # Cash already has the proceeds; only add unrealised P&L
+                value += (pos.entry_price - price) * pos.shares
             else:
                 value += price * pos.shares
         return value
@@ -112,16 +124,27 @@ class Portfolio:
         return net / total
 
     def execute_action(
-        self, ticker: str, action: str, shares: int, price: float, date_str: str
+        self, ticker: str, action: str, shares: int, price: float, date_str: str,
+        current_prices: dict[str, float] | None = None,
     ) -> bool:
-        """Execute a portfolio action. Returns True if successful."""
+        """Execute a portfolio action. Returns True if successful.
+
+        current_prices: used to compute mark-to-market for budget checks.
+        Falls back to cash-based check if not provided.
+        """
         action = action.upper()
+        # Budget is based on portfolio value, not raw cash (raw cash can be
+        # inflated by short sale proceeds).
+        if current_prices:
+            budget = self.mark_to_market(current_prices) * (1 - MIN_CASH_RESERVE_PCT)
+        else:
+            budget = self.cash * (1 - MIN_CASH_RESERVE_PCT)
 
         if action == "BUY":
             cost = price * shares
-            if cost > self.cash * (1 - MIN_CASH_RESERVE_PCT):
-                # Reduce shares to fit cash constraint
-                max_shares = int(self.cash * (1 - MIN_CASH_RESERVE_PCT) / price)
+            available = min(budget, self.cash)  # can't spend more cash than we have
+            if cost > available:
+                max_shares = int(available / price)
                 if max_shares <= 0:
                     logger.warning("Insufficient cash for %s BUY %d @ %.2f", ticker, shares, price)
                     return False
@@ -141,6 +164,7 @@ class Portfolio:
                 self.positions[ticker] = Position(ticker, shares, price, date_str, "LONG")
 
             self.cash -= price * shares
+            self.trade_count += 1
             return True
 
         elif action == "SELL":
@@ -153,14 +177,27 @@ class Portfolio:
             pos.shares -= sell_shares
             if pos.shares <= 0:
                 del self.positions[ticker]
+            self.trade_count += 1
             return True
 
         elif action == "SHORT":
             if ticker in self.positions and not self.positions[ticker].is_short:
                 logger.warning("Cannot short %s: already long", ticker)
                 return False
-            self.positions[ticker] = Position(ticker, shares, price, date_str, "SHORT")
+            if ticker in self.positions and self.positions[ticker].is_short:
+                # Average into existing short position
+                existing = self.positions[ticker]
+                total_shares = existing.shares + shares
+                avg_price = (existing.entry_price * existing.shares + price * shares) / total_shares
+                existing.shares = total_shares
+                existing.entry_price = avg_price
+            else:
+                if len(self.positions) >= MAX_POSITIONS:
+                    logger.warning("Max positions reached, cannot short %s", ticker)
+                    return False
+                self.positions[ticker] = Position(ticker, shares, price, date_str, "SHORT")
             self.cash += price * shares  # Receive cash from short sale
+            self.trade_count += 1
             return True
 
         elif action == "COVER":
@@ -173,6 +210,7 @@ class Portfolio:
             pos.shares -= cover_shares
             if pos.shares <= 0:
                 del self.positions[ticker]
+            self.trade_count += 1
             return True
 
         return False
@@ -262,16 +300,17 @@ async def run_backtest(
             logger.info("=== Day %d: %s ===", day_num, trading_date)
 
             # 1. Fetch market data (try cache first, then live)
+            # Pass trading_date as as_of to prevent look-ahead bias
             macro_data = backtest_loader.load_macro_snapshot(trading_date)
             if not macro_data:
                 try:
-                    macro_data = await data_provider.get_macro_data(trading_date)
+                    macro_data = await data_provider.get_macro_data(as_of=trading_date)
                     backtest_loader.save_macro_snapshot(trading_date, macro_data)
                 except Exception as e:
                     logger.warning("Failed to fetch macro data for %s: %s", trading_date, e)
                     macro_data = {"as_of": trading_date.isoformat()}
 
-            # Get sector data (S&P 500 universe)
+            # Get sector data (S&P 500 universe) — pass trading_date to prevent look-ahead
             all_sector_data = {}
             all_tickers = set()
             for sector in SECTOR_TICKERS:
@@ -280,7 +319,7 @@ async def run_backtest(
                 etf = SECTOR_ETFS.get(sector)
                 try:
                     all_sector_data[sector] = await data_provider.get_sector_data(
-                        tickers, etf_ticker=etf,
+                        tickers, etf_ticker=etf, as_of=trading_date,
                     )
                 except Exception:
                     all_sector_data[sector] = {}
@@ -289,9 +328,10 @@ async def run_backtest(
             for t in portfolio.positions:
                 all_tickers.add(t)
 
+            # Use store-based quotes with date cutoff to avoid look-ahead bias
             prices = {}
             try:
-                quotes = await data_provider.get_quotes(list(all_tickers))
+                quotes = await data_provider.get_quotes_as_of(list(all_tickers), trading_date)
                 prices = {t: q.get("price", 0) for t, q in quotes.items() if q.get("price")}
             except Exception:
                 pass
@@ -331,14 +371,17 @@ async def run_backtest(
                 if price <= 0:
                     continue
 
-                # Check position size limit
+                # Check position size limit (applies to BUY and SHORT)
                 position_value = price * shares
                 total_value = portfolio.mark_to_market(prices)
                 if total_value > 0 and position_value / total_value > MAX_POSITION_PCT:
                     shares = int(total_value * MAX_POSITION_PCT / price)
+                    if shares <= 0:
+                        continue
 
                 success = portfolio.execute_action(
-                    ticker, action, shares, price, trading_date.isoformat()
+                    ticker, action, shares, price, trading_date.isoformat(),
+                    current_prices=prices,
                 )
                 if success:
                     logger.info("Executed: %s %s %d @ %.2f", action, ticker, shares, price)
@@ -354,6 +397,9 @@ async def run_backtest(
                         agent_source="cio",
                         conviction=action_item.get("conviction"),
                     )
+
+            # 3b. Post-trade exposure enforcement
+            _enforce_exposure_limits(portfolio, prices, trading_date.isoformat())
 
             # 4. Record recommendations from all agents for scoring
             _record_agent_recommendations(result, scorecard, trading_date, prices)
@@ -440,8 +486,11 @@ async def run_backtest(
         (values[i] - values[i - 1]) / values[i - 1]
         for i in range(1, len(values)) if values[i - 1] > 0
     ]
-    max_value = max(values) if values else initial_cash
-    drawdowns = [(v - max_value) / max_value for v in values] if values else []
+    running_peak = initial_cash
+    drawdowns = []
+    for v in values:
+        running_peak = max(running_peak, v)
+        drawdowns.append((v - running_peak) / running_peak if running_peak > 0 else 0)
     max_drawdown = min(drawdowns) * 100 if drawdowns else 0
 
     ann_return = ((final_value / initial_cash) ** (252 / max(len(trading_days), 1)) - 1) * 100
@@ -458,7 +507,7 @@ async def run_backtest(
         "annualized_volatility_pct": round(ann_vol, 2),
         "sharpe_ratio": round(sharpe, 3),
         "max_drawdown_pct": round(max_drawdown, 2),
-        "total_trades": len(portfolio.history),
+        "total_trades": portfolio.trade_count,
         "final_positions": len(portfolio.positions),
         "autoresearch": autoresearch.stats(),
         "final_agent_weights": scorecard.get_all_weights(),
@@ -633,6 +682,28 @@ def _generate_charts(
         logger.info("Saved exposure.png")
 
 
+def _enforce_exposure_limits(
+    portfolio: Portfolio, prices: dict[str, float], date_str: str,
+) -> None:
+    """Trim positions proportionally if gross or net exposure exceeds limits."""
+    gross = portfolio.gross_exposure(prices)
+    if gross <= MAX_GROSS_EXPOSURE:
+        return
+
+    # Scale factor to bring gross exposure within limit
+    scale = MAX_GROSS_EXPOSURE / gross if gross > 0 else 1.0
+    logger.warning(
+        "Gross exposure %.1f%% exceeds limit %.1f%%. Trimming positions.",
+        gross * 100, MAX_GROSS_EXPOSURE * 100,
+    )
+    for ticker, pos in list(portfolio.positions.items()):
+        trim_shares = pos.shares - int(pos.shares * scale)
+        if trim_shares > 0:
+            price = prices.get(ticker, pos.entry_price)
+            action = "COVER" if pos.is_short else "SELL"
+            portfolio.execute_action(ticker, action, trim_shares, price, date_str)
+
+
 def _record_agent_recommendations(
     result: dict, scorecard: Scorecard, trading_date: date, prices: dict[str, float]
 ) -> None:
@@ -699,6 +770,19 @@ def _record_agent_recommendations(
                 ))
 
 
+def _trading_days_between(start: date, end: date) -> int:
+    """Count weekdays (Mon-Fri) between two dates, exclusive of start."""
+    if end <= start:
+        return 0
+    count = 0
+    d = start + timedelta(days=1)
+    while d <= end:
+        if d.weekday() < 5:
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
 async def _fill_forward_returns(
     scorecard: Scorecard,
     current_date: date,
@@ -711,19 +795,19 @@ async def _fill_forward_returns(
             continue  # Already filled
 
         rec_date = date.fromisoformat(rec.date)
-        days_elapsed = (current_date - rec_date).days
+        trading_days = _trading_days_between(rec_date, current_date)
 
-        if days_elapsed >= 1 and rec.forward_return_1d is None:
+        if trading_days >= 1 and rec.forward_return_1d is None:
             current = current_prices.get(rec.ticker)
             if current and rec.entry_price > 0:
                 rec.forward_return_1d = (current / rec.entry_price) - 1
 
-        if days_elapsed >= 5:
+        if trading_days >= 5:
             current = current_prices.get(rec.ticker)
             if current and rec.entry_price > 0:
                 rec.forward_return_5d = (current / rec.entry_price) - 1
 
-        if days_elapsed >= 20 and rec.forward_return_20d is None:
+        if trading_days >= 20 and rec.forward_return_20d is None:
             current = current_prices.get(rec.ticker)
             if current and rec.entry_price > 0:
                 rec.forward_return_20d = (current / rec.entry_price) - 1

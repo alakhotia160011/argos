@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 EOD_DIR = Path("data/eod")
 FUNDAMENTALS_DIR = Path("data/fundamentals")
+MACRO_DIR = Path("data/macro")
 
 # Tickers that are indices/futures/currencies — no fundamentals available
 NON_EQUITY_PREFIXES = ("^", "=")
@@ -113,6 +114,181 @@ def _ticker_path(ticker: str, interval: str = "1d") -> Path:
 def _fundamentals_path(ticker: str) -> Path:
     """Path to a ticker's fundamentals JSON."""
     return FUNDAMENTALS_DIR / f"{_sanitize(ticker)}.json"
+
+
+def _macro_path(series_id: str) -> Path:
+    """Path to a FRED series CSV."""
+    return MACRO_DIR / f"{series_id}.csv"
+
+
+# ---------------------------------------------------------------------------
+# FRED macro series
+# ---------------------------------------------------------------------------
+
+FRED_SERIES = {
+    # Rates & yields
+    "fed_funds_rate": "DFF",
+    "treasury_3m": "DGS3MO",
+    "treasury_2y": "DGS2",
+    "treasury_5y": "DGS5",
+    "treasury_10y": "DGS10",
+    "treasury_30y": "DGS30",
+    "yield_curve_10y2y": "T10Y2Y",
+    "yield_curve_10y3m": "T10Y3M",
+    "real_rate_5y": "DFII5",
+    "real_rate_10y": "DFII10",
+    # Inflation
+    "breakeven_inflation_5y": "T5YIE",
+    "breakeven_inflation_10y": "T10YIE",
+    # Credit & risk
+    "ice_bofa_hy_spread": "BAMLH0A0HYM2",
+    "ice_bofa_ig_spread": "BAMLC0A0CM",
+    "ted_spread": "TEDRATE",
+    # Volatility
+    "vix": "VIXCLS",
+    # Dollar
+    "dxy": "DTWEXBGS",
+    # Labor market
+    "initial_claims": "ICSA",
+    "continued_claims": "CCSA",
+    "unemployment_rate": "UNRATE",
+    # Consumer
+    "umich_consumer_sentiment": "UMCSENT",
+    "retail_sales_yoy": "RSAFS",
+    # Manufacturing & activity
+    "ism_pmi": "MANEMP",
+    "industrial_production": "INDPRO",
+    "capacity_utilization": "TCU",
+    # Housing
+    "housing_starts": "HOUST",
+    "mortgage_rate_30y": "MORTGAGE30US",
+    # Money supply
+    "m2_money_supply": "M2SL",
+    # Leading indicators
+    "lei": "USSLIND",
+}
+
+
+def _fetch_fred_series(
+    series_id: str, api_key: str, start_date: str, end_date: str,
+) -> pd.DataFrame:
+    """Fetch a FRED series via the API."""
+    import httpx
+
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": api_key,
+        "file_type": "json",
+        "observation_start": start_date,
+        "observation_end": end_date,
+        "sort_order": "asc",
+    }
+    resp = httpx.get(url, params=params, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    df = pd.DataFrame(data["observations"])
+    if df.empty:
+        return pd.DataFrame()
+    df["date"] = pd.to_datetime(df["date"])
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    return df[["date", "value"]].dropna().sort_values("date").reset_index(drop=True)
+
+
+def load_macro_series(series_id: str) -> pd.DataFrame:
+    """Load stored FRED series. Returns empty DataFrame if none."""
+    path = _macro_path(series_id)
+    if not path.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(path, parse_dates=["date"])
+    return df.sort_values("date").reset_index(drop=True)
+
+
+def save_macro_series(series_id: str, df: pd.DataFrame) -> None:
+    """Save a FRED series to CSV."""
+    if df.empty:
+        return
+    MACRO_DIR.mkdir(parents=True, exist_ok=True)
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    df.to_csv(_macro_path(series_id), index=False)
+
+
+def update_macro_series(series_id: str, api_key: str, start_date: date) -> int:
+    """Update a single FRED series incrementally. Returns new rows added."""
+    existing = load_macro_series(series_id)
+
+    if not existing.empty:
+        last = existing["date"].max().date()
+        fetch_start = last + timedelta(days=1)
+    else:
+        fetch_start = start_date
+
+    today = date.today()
+    if fetch_start > today:
+        return 0
+
+    new_data = _fetch_fred_series(
+        series_id, api_key, fetch_start.isoformat(), today.isoformat(),
+    )
+    if new_data.empty:
+        return 0
+
+    if not existing.empty:
+        combined = pd.concat([existing, new_data], ignore_index=True)
+        combined = combined.drop_duplicates(subset=["date"], keep="last")
+        combined = combined.sort_values("date").reset_index(drop=True)
+    else:
+        combined = new_data
+
+    save_macro_series(series_id, combined)
+    return len(new_data)
+
+
+def update_all_macro(start_date: date = date(2026, 1, 1)) -> dict[str, int]:
+    """Update all FRED macro series."""
+    from src.config import Settings
+    settings = Settings()
+    api_key = settings.fred_api_key
+
+    if not api_key:
+        logger.warning("No FRED_API_KEY set — skipping macro data download")
+        return {}
+
+    logger.info("── Updating %d FRED macro series ──", len(FRED_SERIES))
+    results: dict[str, int] = {}
+    failed: list[str] = []
+
+    for i, (name, series_id) in enumerate(FRED_SERIES.items()):
+        try:
+            n = update_macro_series(series_id, api_key, start_date)
+            results[name] = n
+            if n > 0:
+                logger.info("[%d/%d] %s (%s): +%d rows", i + 1, len(FRED_SERIES), name, series_id, n)
+        except Exception as e:
+            logger.warning("[%d/%d] %s (%s): FAILED - %s", i + 1, len(FRED_SERIES), name, series_id, e)
+            failed.append(name)
+
+        # FRED rate limit: 120 requests/minute
+        if (i + 1) % 20 == 0:
+            time.sleep(1)
+
+    total = sum(results.values())
+    logger.info("FRED update: %d new rows across %d series, %d failed", total, len(results), len(failed))
+    return results
+
+
+def get_macro_from_store(series_id: str, from_date: str, to_date: str) -> pd.DataFrame:
+    """Read stored FRED data for a series within a date range."""
+    df = load_macro_series(series_id)
+    if df.empty:
+        return df
+    mask = (df["date"] >= pd.Timestamp(from_date)) & (df["date"] <= pd.Timestamp(to_date))
+    return df.loc[mask].reset_index(drop=True)
+
+
+def macro_store_has_data(series_id: str) -> bool:
+    """Check if we have stored data for a FRED series."""
+    return _macro_path(series_id).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -506,9 +682,10 @@ def update_all_fundamentals(batch_size: int = 10) -> dict[str, bool]:
 
 
 def update_all(start_date: date = date(2026, 1, 1), batch_size: int = 20) -> None:
-    """Full update: daily prices + 1h prices + fundamentals."""
+    """Full update: daily prices + 1h prices + fundamentals + macro."""
     update_all_prices(start_date, intervals=["1d", "1h"], batch_size=batch_size)
     update_all_fundamentals(batch_size=10)
+    update_all_macro(start_date)
 
 
 # ---------------------------------------------------------------------------
@@ -582,11 +759,21 @@ def store_coverage() -> dict[str, Any]:
 
     equity_count = sum(1 for t in tickers if _is_equity(t))
 
+    # Macro (FRED)
+    macro_stored = 0
+    macro_rows = 0
+    for series_id in FRED_SERIES.values():
+        df_m = load_macro_series(series_id)
+        if not df_m.empty:
+            macro_stored += 1
+            macro_rows += len(df_m)
+
     return {
         "total_tickers": len(tickers),
         "daily": f"{daily_stored} tickers, {daily_rows:,} rows",
         "hourly": f"{hourly_stored} tickers, {hourly_rows:,} rows",
         "fundamentals": f"{fundamentals_stored}/{equity_count} equities",
+        "macro": f"{macro_stored}/{len(FRED_SERIES)} FRED series, {macro_rows:,} rows",
         "date_range": f"{min_date} to {max_date}" if min_date else "no data",
     }
 
@@ -603,7 +790,7 @@ def main():
         help="Start date for initial backfill (default: 2026-01-01)",
     )
     parser.add_argument(
-        "--only", choices=["prices", "fundamentals", "daily", "hourly"],
+        "--only", choices=["prices", "fundamentals", "daily", "hourly", "macro"],
         help="Only update a specific data type",
     )
     parser.add_argument(
@@ -633,6 +820,8 @@ def main():
         update_all_prices(start, intervals=["1h"])
     elif args.only == "fundamentals":
         update_all_fundamentals()
+    elif args.only == "macro":
+        update_all_macro(start)
     else:
         update_all(start)
 
