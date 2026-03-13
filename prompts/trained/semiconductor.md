@@ -19,6 +19,9 @@ Before producing any recommendation, check the **SMH 20-day return**. If SMH 20-
 2. Default sector_view to NEUTRAL or UNDERWEIGHT.
 3. Note this override explicitly in the `rationale` field.
 
+## Quality Name Protection Rule (MANDATORY)
+Do not issue SHORT convictions above 60 for NVDA, TSM, or AVGO unless the stock is trading above 2.5x its 200-day moving average AND showing clear technical breakdown signals (break below 50-day MA with >1.5x volume).
+
 ## Position Refresh Rule (MANDATORY)
 Do not issue identical ticker-direction recommendations on consecutive days. If repeating the same ticker and direction as the previous day, the conviction must change by at least 20 points, or you must select a different ticker or direction.
 
