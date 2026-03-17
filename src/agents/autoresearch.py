@@ -236,8 +236,8 @@ class AutoresearchEngine:
             repo = git_ops.get_repo()
             git_ops.create_branch(repo, branch_name)
             prompt_path.write_text(new_prompt)
-            git_ops.commit_change(
-                repo, prompt_path,
+            git_ops.commit_to_branch(
+                repo, branch_name, prompt_path,
                 f"autoresearch: {description[:80]}",
             )
             # Git succeeded, remove backup
