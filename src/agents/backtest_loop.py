@@ -19,7 +19,6 @@ Known residual biases (not fixable without point-in-time datasets):
   - Survivorship: S&P 500 universe is today's membership list, not point-in-time.
   - Fundamentals look-ahead: yfinance returns the latest financials, not
     the version available on `trading_date`.
-  - News look-ahead: Finnhub news is live, not date-filtered.
   These biases are minor for short backtests (< 1 year) but significant for
   multi-year tests. Use results directionally, not as precise P&L forecasts.
 """

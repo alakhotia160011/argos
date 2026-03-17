@@ -32,6 +32,9 @@ data = [
     "pyarrow>=15.0.0",
     "matplotlib>=3.8.0",
 ]
+broker = [
+    "alpaca-py>=0.30.0",
+]
 
 [project.scripts]
 argos-backtest = "src.agents.backtest_loop:main"

@@ -33,6 +33,25 @@ from src.utils.logging import log_agent_call
 
 logger = logging.getLogger(__name__)
 
+# Optional progress callback — set by the API server for live updates.
+# Signature: async def callback(event: str, data: dict) -> None
+_progress_callback: Any | None = None
+
+
+def set_progress_callback(cb: Any | None) -> None:
+    """Set a global progress callback for agent-level updates."""
+    global _progress_callback
+    _progress_callback = cb
+
+
+async def _emit(event: str, data: dict) -> None:
+    """Emit a progress event if a callback is registered."""
+    if _progress_callback is not None:
+        try:
+            await _progress_callback(event, data)
+        except Exception:
+            pass  # never let callback errors break the pipeline
+
 
 # ---------------------------------------------------------------------------
 # Prompt loading
@@ -59,6 +78,7 @@ async def run_macro_agent(
     macro_data: dict[str, Any],
 ) -> dict[str, Any]:
     """Run a single macro agent and return its signal."""
+    await _emit("agent_start", {"agent": agent_name, "layer": 1, "layer_name": "MACRO"})
     system_prompt = load_prompt(agent_name, prompt_dir)
     user_msg = (
         f"Today's date: {macro_data.get('as_of', 'unknown')}\n\n"
@@ -68,6 +88,9 @@ async def run_macro_agent(
     result = await call_agent_json(system_prompt, user_msg)
     result["_agent"] = agent_name
     log_agent_call(agent_name, "macro", {"as_of": macro_data.get("as_of")}, result)
+    signal = result.get("signal", result.get("regime", "NEUTRAL"))
+    conviction = result.get("conviction", 50)
+    await _emit("agent_done", {"agent": agent_name, "layer": 1, "layer_name": "MACRO", "signal": signal, "conviction": conviction})
     return result
 
 
@@ -187,6 +210,7 @@ async def run_sector_agent(
     if agent_name == "relationship_mapper":
         return await run_relationship_mapper(prompt_dir, macro_regime, sector_data)
 
+    await _emit("agent_start", {"agent": agent_name, "layer": 2, "layer_name": "SECTOR"})
     system_prompt = load_prompt(agent_name, prompt_dir)
     user_msg = (
         f"## Macro Regime\n{json.dumps(macro_regime, indent=2)}\n\n"
@@ -196,6 +220,9 @@ async def run_sector_agent(
     result = await call_agent_json(system_prompt, user_msg)
     result["_agent"] = agent_name
     log_agent_call(agent_name, "sector", {"regime": macro_regime.get("regime")}, result)
+    picks = result.get("top_longs", result.get("longs", []))
+    n_picks = len(picks) if isinstance(picks, list) else 0
+    await _emit("agent_done", {"agent": agent_name, "layer": 2, "layer_name": "SECTOR", "picks": n_picks})
     return result
 
 
@@ -205,6 +232,7 @@ async def run_relationship_mapper(
     all_sector_data: dict[str, Any],
 ) -> dict[str, Any]:
     """Run the relationship mapper across all sectors."""
+    await _emit("agent_start", {"agent": "relationship_mapper", "layer": 2, "layer_name": "SECTOR"})
     system_prompt = load_prompt("relationship_mapper", prompt_dir)
     user_msg = (
         f"## Macro Regime\n{json.dumps(macro_regime, indent=2)}\n\n"
@@ -213,6 +241,7 @@ async def run_relationship_mapper(
     )
     result = await call_agent_json(system_prompt, user_msg)
     result["_agent"] = "relationship_mapper"
+    await _emit("agent_done", {"agent": "relationship_mapper", "layer": 2, "layer_name": "SECTOR"})
     return result
 
 
@@ -254,6 +283,7 @@ async def run_superinvestor_agent(
     macro_regime: dict[str, Any],
 ) -> dict[str, Any]:
     """Run a single superinvestor agent."""
+    await _emit("agent_start", {"agent": agent_name, "layer": 3, "layer_name": "SUPERINVESTOR"})
     system_prompt = load_prompt(agent_name, prompt_dir)
     user_msg = (
         f"## Macro Regime\n{json.dumps(macro_regime, indent=2)}\n\n"
@@ -265,6 +295,7 @@ async def run_superinvestor_agent(
     result = await call_agent_json(system_prompt, user_msg)
     result["_agent"] = agent_name
     log_agent_call(agent_name, "superinvestor", {"regime": macro_regime.get("regime")}, result)
+    await _emit("agent_done", {"agent": agent_name, "layer": 3, "layer_name": "SUPERINVESTOR"})
     return result
 
 
@@ -305,6 +336,7 @@ async def run_cro(
     macro_regime: dict[str, Any],
 ) -> dict[str, Any]:
     """Run the CRO (adversarial risk review)."""
+    await _emit("agent_start", {"agent": "cro", "layer": 4, "layer_name": "DECISION"})
     system_prompt = load_prompt("cro", prompt_dir)
     user_msg = (
         f"## Macro Regime\n{json.dumps(macro_regime, indent=2)}\n\n"
@@ -316,6 +348,7 @@ async def run_cro(
     result = await call_agent_json(system_prompt, user_msg)
     result["_agent"] = "cro"
     log_agent_call("cro", "decision", {"regime": macro_regime.get("regime")}, result)
+    await _emit("agent_done", {"agent": "cro", "layer": 4, "layer_name": "DECISION"})
     return result
 
 
@@ -326,6 +359,7 @@ async def run_alpha_discovery(
     macro_regime: dict[str, Any],
 ) -> dict[str, Any]:
     """Run the Alpha Discovery agent."""
+    await _emit("agent_start", {"agent": "alpha_discovery", "layer": 4, "layer_name": "DECISION"})
     system_prompt = load_prompt("alpha_discovery", prompt_dir)
     user_msg = (
         f"## Macro Regime\n{json.dumps(macro_regime, indent=2)}\n\n"
@@ -337,6 +371,7 @@ async def run_alpha_discovery(
     result = await call_agent_json(system_prompt, user_msg)
     result["_agent"] = "alpha_discovery"
     log_agent_call("alpha_discovery", "decision", {"regime": macro_regime.get("regime")}, result)
+    await _emit("agent_done", {"agent": "alpha_discovery", "layer": 4, "layer_name": "DECISION"})
     return result
 
 
@@ -393,10 +428,12 @@ async def run_decision_layer(
     )
 
     # CIO runs last with all inputs
+    await _emit("agent_start", {"agent": "cio", "layer": 4, "layer_name": "DECISION"})
     cio_result = await run_cio(
         prompt_dir, macro_regime, sector_picks, superinvestor_views,
         cro_result, alpha_result, portfolio, weights,
     )
+    await _emit("agent_done", {"agent": "cio", "layer": 4, "layer_name": "DECISION"})
 
     return {
         "cro": cro_result,
@@ -474,7 +511,10 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Run ARGOS end-of-day cycle")
-    parser.parse_args()
+    parser.add_argument("--execute", action="store_true", help="Execute trades via Alpaca broker")
+    parser.add_argument("--dry-run", action="store_true", help="Log orders without submitting")
+    parser.add_argument("--no-confirm", action="store_true", help="Skip order confirmation prompt")
+    args = parser.parse_args()
 
     from src.utils.logging import setup_logging
     setup_logging()
@@ -482,13 +522,30 @@ def main() -> None:
     settings = Settings()
     logger.info("Starting EOD cycle")
 
-    # This would be called with real data in production
-    asyncio.run(_run_live(settings))
+    asyncio.run(_run_live(settings, execute=args.execute, dry_run=args.dry_run, no_confirm=args.no_confirm))
 
 
-async def _run_live(settings: Settings) -> None:
-    """Run a live EOD cycle with real market data."""
+async def _run_live(
+    settings: Settings,
+    execute: bool = False,
+    dry_run: bool = False,
+    no_confirm: bool = False,
+) -> None:
+    """Run a live EOD cycle with real market data.
+
+    If --execute is passed, trades are submitted to Alpaca after the agent
+    pipeline produces its recommendations.
+    """
     from src.agents.market_data import MarketDataProvider
+
+    # If executing, use Alpaca portfolio state instead of local file
+    broker = None
+    if execute or dry_run:
+        from src.broker.alpaca import AlpacaBroker, BrokerConfig
+        config = BrokerConfig(dry_run=dry_run, require_confirmation=not no_confirm)
+        broker = AlpacaBroker(config, settings)
+        broker.sync_portfolio_state()
+        logger.info("Broker connected — portfolio synced from Alpaca")
 
     provider = MarketDataProvider(settings)
     try:
@@ -502,7 +559,7 @@ async def _run_live(settings: Settings) -> None:
             logger.info("Sector %s: %d tickers, ETF=%s", sector, len(tickers), etf)
             all_sector_data[sector] = await provider.get_sector_data(tickers, etf_ticker=etf)
 
-        # Load current portfolio
+        # Load current portfolio (from Alpaca sync or local file)
         portfolio_path = settings.state_dir / "portfolio.json"
         if portfolio_path.exists():
             portfolio = json.loads(portfolio_path.read_text())
@@ -517,6 +574,22 @@ async def _run_live(settings: Settings) -> None:
             settings.prompt_dir, macro_data, all_sector_data, portfolio, weights, settings.state_dir,
         )
         logger.info("EOD cycle complete. Regime: %s", result["macro"]["regime"])
+
+        # Execute trades via broker if requested
+        if broker:
+            cio_output = result.get("decision", {}).get("cio", {})
+            actions = cio_output.get("portfolio_actions", cio_output.get("actions", []))
+            if isinstance(actions, dict):
+                actions = [actions]
+            if actions:
+                results = broker.execute_actions(
+                    actions, confirm=not no_confirm,
+                )
+                logger.info("Broker execution: %d orders processed", len(results))
+                # Sync portfolio state after execution
+                broker.sync_portfolio_state()
+            else:
+                logger.info("No portfolio actions from CIO")
     finally:
         await provider.close()
 

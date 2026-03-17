@@ -78,6 +78,17 @@ def _yf_get_quotes(tickers: list[str]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
+GDELT_TOPICS = {
+    "geopolitical": "iran OR war OR conflict OR sanctions OR NATO OR missile OR nuclear OR invasion",
+    "trade_policy": "tariff OR trade war OR trade deal OR export ban OR import duty",
+    "macro_policy": "federal reserve OR ECB OR central bank OR interest rate OR inflation OR recession",
+    "energy": "oil OR OPEC OR natural gas OR pipeline OR energy crisis",
+    "tech": "semiconductor OR chip OR AI regulation OR tech ban OR antitrust",
+}
+
+GDELT_API_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
+
+
 class MarketDataProvider:
     """Unified market data interface across multiple providers."""
 
@@ -86,6 +97,8 @@ class MarketDataProvider:
         self.cache_dir = self.settings.cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._http = httpx.AsyncClient(timeout=30)
+        self._news_dir = self.settings.data_dir / "news"
+        self._news_dir.mkdir(parents=True, exist_ok=True)
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -228,6 +241,79 @@ class MarketDataProvider:
 
     async def get_sentiment(self, ticker: str) -> dict:
         return await self._finnhub("news-sentiment", {"symbol": ticker})
+
+    # ── GDELT News ───────────────────────────────────────────────────────
+
+    async def _fetch_gdelt(
+        self, query: str, as_of: date, max_records: int = 10
+    ) -> list[dict]:
+        """Fetch headlines from GDELT DOC API for a single query + date."""
+        start = as_of.strftime("%Y%m%d") + "000000"
+        end = as_of.strftime("%Y%m%d") + "235959"
+        params = {
+            "query": f"({query}) sourcelang:english",
+            "startdatetime": start,
+            "enddatetime": end,
+            "maxrecords": max_records,
+            "format": "json",
+            "sort": "hybridrel",
+        }
+        try:
+            resp = await self._http.get(GDELT_API_URL, params=params, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            return [
+                {
+                    "title": a.get("title", ""),
+                    "date": a.get("seendate", ""),
+                    "source": a.get("domain", ""),
+                    "country": a.get("sourcecountry", ""),
+                }
+                for a in data.get("articles", [])
+            ]
+        except Exception as e:
+            logger.debug("GDELT fetch failed for '%s': %s", query[:40], e)
+            return []
+
+    async def get_news_data(self, as_of: date | None = None) -> dict[str, Any]:
+        """Fetch categorised news headlines from GDELT, with local cache.
+
+        Returns a dict with categories mapping to lists of headline dicts.
+        Uses as_of for date-filtered queries (no look-ahead bias in backtests).
+        """
+        ref_date = as_of or date.today()
+        cache_path = self._news_dir / f"{ref_date.isoformat()}.json"
+
+        if cache_path.exists():
+            try:
+                return json.loads(cache_path.read_text())
+            except json.JSONDecodeError:
+                cache_path.unlink(missing_ok=True)
+
+        categories: dict[str, list[dict]] = {}
+        seen_titles: set[str] = set()
+
+        for category, query in GDELT_TOPICS.items():
+            await asyncio.sleep(5)  # GDELT rate limit: 1 request per 5 seconds
+            raw = await self._fetch_gdelt(query, ref_date)
+            deduped = []
+            for article in raw:
+                title_key = article["title"].lower().strip()
+                if title_key and title_key not in seen_titles:
+                    seen_titles.add(title_key)
+                    deduped.append(article)
+            categories[category] = deduped
+
+        total = sum(len(v) for v in categories.values())
+        result = {
+            "as_of": ref_date.isoformat(),
+            "categories": categories,
+            "headline_count": total,
+        }
+
+        cache_path.write_text(json.dumps(result, indent=2))
+        logger.info("GDELT: fetched %d headlines for %s", total, ref_date)
+        return result
 
     # ── Polygon ──────────────────────────────────────────────────────────
 
@@ -498,8 +584,8 @@ class MarketDataProvider:
             else:
                 market_data[name] = r
 
-        # ── News ──
-        news = await self.get_market_news()
+        # ── News (GDELT, date-filtered) ──
+        news = await self.get_news_data(as_of=as_of)
 
         # ── Derived signals ──
         derived = {}

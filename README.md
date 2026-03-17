@@ -68,20 +68,44 @@ Over time, good agents get louder. Bad agents get quieter. The system learns who
 
 ---
 
+## Bias Controls
+
+Backtest integrity is critical. ARGOS enforces strict date boundaries to prevent look-ahead bias:
+
+- **Price data** - all queries receive `as_of=trading_date`; prices come from the local EOD store via `get_quotes_as_of()`, never live quotes
+- **FRED macro data** - filtered to `<= trading_date`
+- **Sector data** - uses `trading_date` as the end of the lookback window
+- **Forward returns** - counted in trading days (weekdays), not calendar days
+
+**Risk controls enforced in code (not just in CIO prompt):**
+- `MAX_POSITION_PCT` enforced for both BUY and SHORT
+- `MAX_GROSS_EXPOSURE` enforced post-trade with automatic position trimming
+- Cash reserve checks use `mark_to_market` portfolio value, not raw cash (which can be inflated by short proceeds)
+
+**Known residual biases (not fixable without point-in-time datasets):**
+- Survivorship: S&P 500 universe is today's membership list, not point-in-time
+- Fundamentals: yfinance returns the latest financials, not the version available on `trading_date`
+- News: Finnhub news is live, not date-filtered
+
+These are minor for short backtests (< 1 year). Use results directionally, not as precise P&L forecasts.
+
+---
+
 ## Data Pipeline
 
 ### Market Data
-- **FRED** - 30 macro series (rates, credit, labor, inflation, sentiment)
+- **FRED** - 29 macro series (rates, credit spreads, labor, inflation, consumer sentiment, housing, money supply, LEI)
 - **yfinance** - indices, sector ETFs, commodities, bonds, currencies, volatility
 - **FMP** - fundamentals, financials (with stable API fallback)
 
 ### EOD Data Store
 Pre-cached local data store for all S&P 500 + macro tickers:
 - **Daily OHLCV** - full history per ticker
-- **1-Hour Intraday** - granular price action
+- **1-Hour Intraday** - granular price action (730-day max lookback)
 - **Fundamentals** - financials, analyst ratings, institutional holdings, options data
+- **FRED Macro** - 29 series with incremental updates
 
-Incremental updates — only fetches new days since last stored date.
+Incremental updates only — fetches new days since last stored date. No repeated API calls.
 
 ### Stock Universe
 - Full **S&P 500** constituents (fetched from Wikipedia, mapped via GICS sectors)
@@ -100,18 +124,19 @@ argos/
 │   │   ├── eod_cycle.py           # 4-layer daily pipeline orchestration
 │   │   ├── backtest_loop.py       # Portfolio simulation + training loop
 │   │   ├── market_data.py         # Multi-source data provider (FMP, FRED, yfinance)
-│   │   ├── eod_store.py           # Incremental EOD data store
+│   │   ├── eod_store.py           # Incremental EOD + fundamentals + macro store
 │   │   ├── scorecard.py           # Agent Sharpe ratios + Darwinian weights
 │   │   ├── autoresearch.py        # Self-improving prompt evolution
 │   │   └── universe.py            # S&P 500 universe + GICS sector mapping
 │   └── utils/
-│       ├── llm.py                 # Anthropic API wrapper with retries
+│       ├── llm.py                 # Anthropic API wrapper (bracket-counting JSON parser)
 │       ├── git_ops.py             # Git branching for autoresearch
 │       └── logging.py             # Structured logging (JSONL)
 ├── prompts/trained/               # 25 agent prompts (evolutionary optimised)
 ├── data/
 │   ├── eod/                       # Cached daily + hourly price data
-│   ├── fundamentals/              # Cached company fundamentals
+│   ├── fundamentals/              # Cached company fundamentals (JSON per ticker)
+│   ├── macro/                     # Cached FRED macro series (CSV per series)
 │   ├── state/                     # Live pipeline state (weights, portfolio, regime)
 │   ├── logs/                      # Structured logs (trades, performance, agent calls)
 │   └── cache/                     # S&P 500 constituent cache
@@ -134,17 +159,20 @@ pip install -e ".[dev,data]"
 
 ```bash
 cp .env.example .env
-# Add your keys: ANTHROPIC_API_KEY, FRED_API_KEY, FMP_API_KEY (optional)
+# Add your keys: ARGOS_ANTHROPIC_API_KEY, ARGOS_FRED_API_KEY, ARGOS_FMP_API_KEY (optional)
 ```
 
 ### 3. Download market data
 
 ```bash
-# Initial download (daily + hourly + fundamentals for ~544 tickers)
+# Initial download (daily + hourly + fundamentals + macro for ~544 tickers)
 python -m src.agents.eod_store
 
 # Incremental update (only fetches new days)
 python -m src.agents.eod_store
+
+# Only update macro data
+python -m src.agents.eod_store --only macro
 
 # Check coverage
 python -m src.agents.eod_store --coverage
@@ -171,7 +199,7 @@ argos-eod
 ## Outputs
 
 ### Results (`results/`)
-- `summary.json` - return, Sharpe, max drawdown, agent weights
+- `summary.json` - return, Sharpe, max drawdown, trade count, agent weights
 - `equity_curve.png` - NAV, daily returns, drawdown chart
 - `agent_weights.png` - Darwinian weights + Sharpe ratios
 - `exposure.png` - gross/net exposure over time
