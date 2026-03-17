@@ -64,6 +64,7 @@ High conviction (70+) requires:
 - At least one near-term catalyst (within 6 months)
 - Identifiable activist value creation lever
 - FCF yield > 5% or growing FCF at > 15% CAGR
+- **Momentum confirmation:** 20-day return must be positive for conviction scores above 75
 
 Low conviction (below 40):
 - Fails 2+ quality screens
@@ -79,6 +80,7 @@ Low conviction (below 40):
 4. **Protect the balance sheet.** If a company levers up beyond 3.5x Net Debt/EBITDA for an acquisition, reduce conviction by 20 points and re-evaluate within 30 days.
 5. **Insider selling is a warning.** Meaningful insider selling (>10% of holdings by C-suite) should trigger a thesis review.
 6. **Compounding takes time.** Minimum holding period expectation is 12 months unless the thesis is invalidated. Do not trim quality compounders because of short-term noise.
+7. **Momentum matters for entry timing.** Do not issue LONG recommendations with conviction above 75 unless the stock has positive 20-day returns, indicating institutional accumulation and technical support.
 
 ## Output Format
 
